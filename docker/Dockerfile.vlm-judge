@@ -1,0 +1,26 @@
+# Judge image: the base VLM image already has Python 3.10, OpenCV and GStreamer; we add paho-mqtt and our package.
+# Build on the device (arm64), from the repository root (docs/sop-build-push-image.md, section 4):
+#   docker build -f docker/Dockerfile.vlm-judge --build-context assets=../vlm-ppe-demo-assets -t vlm-judge:<version> .
+# The model and the demo clip come from the named context "assets". If the build stops with "pull access denied" for "assets", that option is missing.
+ARG BASE_IMAGE=harbor.edgesync.cloud/nycu-cosmos-lab/multimodal-gemma4-e2b-it-onnx-on-qualcomm-hexagon:v1@sha256:55f33cf27fcdf4f007ebd9306b4ccff86cd7d6257fe79ae2b8e010c4fc4d8950
+FROM ${BASE_IMAGE}
+
+LABEL maintainer="Advantech Corporation" vendor="Advantech" version="0.13.3" description="VLM PPE judge: camera -> model server -> verdict -> MQTT"
+
+# paho-mqtt: the publisher; nothing is installed at run time. numpy comes with the base image.
+RUN pip install --no-cache-dir paho-mqtt==2.1.0 \
+ && python3 -c "import paho.mqtt.client, cv2, numpy; print('CHECKS PASSED')"
+
+# The Gemma 4 model (about 4 GB: the F16 vision encoder already converted), built in like the YOLO demo builds in its models. It is under /data, the
+# mount point of the model volume: when the stack starts with a new, empty volume, Docker fills it from here. It comes from the named build context
+# "assets", not from the repository, and sits before the code so that a code change does not change this layer.
+COPY --from=assets /model-seed/ /data/
+
+WORKDIR /app
+COPY src/vlm_judge /app/vlm_judge
+# The demo clip is part of the image (JUDGE_SOURCE=/app/clips/OD_Jar.mp4), so the demo needs no file on the host.
+COPY --from=assets /clips/OD_Jar.mp4 /app/clips/OD_Jar.mp4
+ENV PYTHONPATH=/app PYTHONUNBUFFERED=1
+
+# the base image's entrypoint (Hexagon setup) is not needed: the judge only talks HTTP and MQTT
+ENTRYPOINT ["python3", "-m", "vlm_judge"]

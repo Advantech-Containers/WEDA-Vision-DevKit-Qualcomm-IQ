@@ -1,0 +1,176 @@
+# WEDA stack: VLM PPE judge demo on the AIR-055 (deploy through WEDA container-management)
+#
+# WHAT THIS DEPLOYS: four services on one board, all on the host network
+#   geniex-serve       the AI model server (Gemma 4 on the NPU), with a supervisor that restarts it when it stops answering
+#   mqtt-broker        a local message bus, reachable only from the board itself
+#   vlm-judge          camera -> model -> verdict -> messages, and the live web page on port 8080
+#   vlm-judge-subnode  turns the judge's messages into WEDA data streams and the judge.now command
+#
+# HOW TO USE IT: paste this file as the stack's compose file, and put the settings you want to change in the stack's
+# environment (one KEY and VALUE per setting). A setting you leave out uses the default shown below. Only the settings listed
+# here reach the containers: an environment entry that is not named in this file is ignored.
+#
+# SETTINGS YOU MAY WANT TO CHANGE (name = default: what it does)
+#   DEVICE_ID = (the board's own id)      the 12 hex node id of the board. On WEDA leave it out: the agent supplies it. Without WEDA set it; the judge and the Sub-Node always use the same id
+#   HTTP_BIND = 127.0.0.1                the web page is reachable only on the board; use 0.0.0.0 to open it from another machine
+#   API_PORT = 0                         the optional read-only HTTP API and its Swagger page (/api/docs) is off; set 8081 to turn it on
+#   JUDGE_SOURCE = /dev/video0           the camera, or the demo video built into the image, /app/clips/OD_Jar.mp4
+#   REQUIRED_PPE = helmet,vest           which items are judged: helmet, vest, gloves, goggles (gloves and goggles also need PROMPT_VERSION=ppe-v5)
+#   PROMPT_VERSION = ppe-v3              which prompt the model gets: ppe-v3, ppe-v4 for a partly visible person, or ppe-v5 (made from REQUIRED_PPE)
+#   PROMPT_TEXT = (empty)                the question in your own words instead of the built-in one. The model must still answer in the same JSON (see the reference)
+#   WEB_VIEW = true                      false turns the live picture page off
+#   VIEW_HUD = false                     true puts the state, people count, judgement number and demo label on the picture (they are in the log either way)
+#   VIEW_DESCRIPTION = true              the model's sentence at the bottom of the picture; false hides it
+#   LOG_JUDGEMENTS = true                one line per judgement in the judge's log: number, state, people, time and description; false silences them
+#   LOG_LEVEL = INFO                     DEBUG for more detail in the judge's log
+#   WEDA_DATA_PATH = /opt/Advantech/vlm-judge-subnode/weda-data-sit   the board folder that keeps the Sub-Node's registration (one WEDA device, not two). Changing it makes a new registration
+#   SUBNODE_NAME = VlmJudge-<device id>  the Sub-Node's name in WEDA (names are unique per organisation; WEDA fills in the device id)
+#   SystemConfig__WedaNode__Password     only for a board whose WedaNode uses another password than the default, which is built into the Sub-Node image
+#   Timeouts, the watchdog, the re-check of a violation and similar tuning keep their built-in defaults (docs/vlm-container-reference.md, section 5).
+#
+# NOTES
+#   - Images are named by version below. To use a new version, change the tag (docs/sop-build-push-image.md). A version is never pushed twice: a new build gets a new tag.
+#   - A new revision is applied by deploying it: only the services whose settings changed restart. If a deploy ever leaves the old containers running, clear the device and deploy again (docs/sop-run-on-edge-device.md).
+#   - WEDA names the containers edge_<stack>_<service>, for example edge_vlm-ppe-demo_vlm-judge. Do not set container_name.
+#   - The model is built into the judge image, under /data. Docker fills the new, empty volume vlm-geniex-data (created by this stack) from it when
+#     the judge container is created, so nothing is downloaded or copied by hand. That is why the judge is created before the model server
+#     (geniex-serve depends on it) and mounts the volume. A volume that already has content is used as it is.
+#   - The board keeps the folder /opt/Advantech/vlm-judge-subnode/weda-data-sit (the Sub-Node's registration; Docker creates it, do not delete it),
+#     and needs a camera on /dev/video0 (or JUDGE_SOURCE=/app/clips/OD_Jar.mp4, which is built in).
+#   - The images are pulled from a private registry: the organisation needs a registry entry with a credential in WEDA.
+
+services:
+  # --- model server, with a supervisor: restart `geniex serve` when it stops answering (seen hanging, no abort message)
+  geniex-serve:
+    image: qualcomm/geniex:v0.7.1
+    network_mode: host
+    privileged: true
+    restart: unless-stopped
+    stop_grace_period: 20s
+    depends_on:
+      - vlm-judge                       # created first: Docker fills the model volume from the judge image, and the server must not see it half full
+    environment:
+      GGML_HEXAGON_NDEV: "2"            # LLM on NPU core 0, vision encoder on core 1
+    volumes:
+      - /usr/lib:/opt/qcom-lib:ro
+      - geniex-data:/data               # the model (its vision encoder already F16); a volume that is attached cannot be pruned by mistake
+    command:
+      - bash
+      - -c
+      - |
+        MODEL=gemma-4-E2B-it-qat-q4_0-gguf
+        until geniex list --skip-update 2>/dev/null | grep -q "$$MODEL"; do
+          echo "[supervisor] model $$MODEL is not in /data yet: Docker copies it from the judge image when the judge container is created"
+          sleep 10
+        done
+        probe() {
+          timeout 6 bash -c 'exec 3<>/dev/tcp/127.0.0.1/18181; printf "GET /v1/models HTTP/1.0\r\n\r\n" >&3; head -1 <&3 | grep -q " 200 "'
+        }
+        # A server can answer /v1/models and still fail every request (for example HTTP 500 "SDKError"). This sends a
+        # 1-token text request; only an explicit 5xx counts as failed. A request that is still running (busy, slow) is fine.
+        chat_probe() {
+          timeout 90 bash -c 'exec 3<>/dev/tcp/127.0.0.1/18181; B="{\"model\":\"google/'"$$MODEL"':Q4_0\",\"messages\":[{\"role\":\"user\",\"content\":\"ok\"}],\"max_tokens\":1}"; printf "POST /v1/chat/completions HTTP/1.0\r\nContent-Type: application/json\r\nContent-Length: $${#B}\r\n\r\n%s" "$$B" >&3; head -1 <&3 | grep -q " 5[0-9][0-9] "; [ $$? -ne 0 ]'
+          [ $$? -ne 1 ]
+        }
+        PID=0
+        trap 'kill $$PID 2>/dev/null; exit 0' TERM INT
+        while true; do
+          geniex serve --host 127.0.0.1:18181 --vit-compute HTP1 --skip-update &
+          PID=$$!
+          fails=0; cfails=0; tick=0
+          sleep 15
+          while kill -0 $$PID 2>/dev/null; do
+            if probe; then fails=0; else fails=$$((fails+1)); echo "[supervisor] probe failed ($$fails)"; fi
+            if [ $$fails -ge 3 ]; then echo "[supervisor] server not answering: restarting it"; kill -9 $$PID; break; fi
+            tick=$$((tick+1))
+            if [ $$tick -ge 16 ] && [ $$((tick % 8)) -eq 0 ]; then       # every ~35 s, from ~70 s after the start
+              if chat_probe; then cfails=0; else cfails=$$((cfails+1)); echo "[supervisor] chat probe got a server error ($$cfails)"; fi
+              if [ $$cfails -ge 3 ]; then echo "[supervisor] server answers but fails requests: restarting it"; kill -9 $$PID; break; fi
+            fi
+            sleep 4 & wait $$!
+          done
+          wait $$PID 2>/dev/null
+          echo "[supervisor] geniex serve stopped; restarting in 3 s"; sleep 3
+        done
+    logging:
+      driver: json-file
+      options:
+        max-size: '5m'
+        max-file: '3'
+
+  # --- loopback broker
+  mqtt-broker:
+    image: eclipse-mosquitto:2.1.2-alpine
+    network_mode: host
+    restart: unless-stopped
+    command: ["sh", "-c", "printf 'listener 1883 127.0.0.1\\nallow_anonymous true\\n' > /tmp/m.conf && exec mosquitto -c /tmp/m.conf"]
+    logging:
+      driver: json-file
+      options:
+        max-size: '2m'
+        max-file: '2'
+
+  # --- judge: camera -> model server -> verdict -> MQTT
+  vlm-judge:
+    image: harbor.edgesync.cloud/vlm-demo-ppe/vlm-judge:0.13.3
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - mqtt-broker                     # the judge waits for the model server by itself (it retries until it answers)
+    # privileged only so the judge can open the camera: WEDA Node v1.2 ignores `devices:` (v1.1 honoured it), and /dev/v4l/by-id
+    # is not visible inside, so the camera is /dev/video0
+    privileged: true
+    stop_grace_period: 50s              # a violation is checked on up to 3 requests of up to 15 s each, and a stop waits for them; leave time for the clean 'offline'
+    volumes:
+      - geniex-data:/data               # the model volume: Docker fills it from the model in this image when it is empty (first start); the judge does not read it
+    environment:
+      JUDGE_MODE: ppe
+      DEVICE_ID: ${DEVICE_ID:-${EDGESYNC_EDGE_ID}}
+      JUDGE_SOURCE: ${JUDGE_SOURCE:-/dev/video0}
+      PROMPT_VERSION: ${PROMPT_VERSION:-ppe-v3}
+      REQUIRED_PPE: ${REQUIRED_PPE:-helmet,vest}
+      HTTP_BIND: ${HTTP_BIND:-127.0.0.1}      # web view address; 0.0.0.0 to open it from another machine
+      API_PORT: ${API_PORT:-0}                # optional read-only HTTP API for other programs (0 = off); same address as the web page
+      PROMPT_TEXT: ${PROMPT_TEXT:-}           # your own question; empty = the built-in PROMPT_VERSION
+      WEB_VIEW: ${WEB_VIEW:-true}
+      VIEW_HUD: ${VIEW_HUD:-false}
+      VIEW_DESCRIPTION: ${VIEW_DESCRIPTION:-true}
+      LOG_JUDGEMENTS: ${LOG_JUDGEMENTS:-true}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    logging:
+      driver: json-file
+      options:
+        max-size: '5m'
+        max-file: '3'
+
+  # --- Sub-Node: MQTT -> WedaNode (local NATS) -> WEDA Cloud
+  vlm-judge-subnode:
+    image: harbor.edgesync.cloud/vlm-demo-ppe/vlm-judge-subnode:0.7.0
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - mqtt-broker
+    environment:
+      # the sensor catalog is in the image; only the judge to listen to is set here
+      DeviceConfig__DeviceConfigs__VlmJudgeConfig__DeviceCommunication__DeviceId: ${DEVICE_ID:-${EDGESYNC_EDGE_ID}}
+      # SubNode names are unique per organisation: the agent supplies EDGESYNC_EDGE_ID (the device id), so one stack serves many boards.
+      # Only the first registration uses the name; an already registered board keeps its own.
+      DeviceConfig__SubNode__Name: ${SUBNODE_NAME:-VlmJudge-${EDGESYNC_EDGE_ID:-local}}
+      # The WedaNode login (address, user name and the WedaNode's default password) is built into the Sub-Node image, as the SDK delivers its images.
+      # Set SystemConfig__WedaNode__Password in the stack's environment only for a board whose WedaNode uses a different password. No value
+      # here on purpose: a default of "" would be passed on and replace the password the image carries.
+      SystemConfig__WedaNode__Password:
+    volumes:
+      # registration identity survives redeploys (one WEDA device, not two)
+      - ${WEDA_DATA_PATH:-/opt/Advantech/vlm-judge-subnode/weda-data-sit}:/app/.weda
+    logging:
+      driver: json-file
+      options:
+        max-size: '5m'
+        max-file: '3'
+
+# Created by this stack when it is missing, and kept when the stack is removed. Docker fills it from the model built into the judge image when it is
+# empty (a volume that already has content, for example one made by hand or by `geniex pull`, is used as it is).
+volumes:
+  geniex-data:
+    name: vlm-geniex-data
